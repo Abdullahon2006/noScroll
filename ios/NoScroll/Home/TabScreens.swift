@@ -1,4 +1,16 @@
+import SafariServices
 import SwiftUI
+
+/// Safari browser sheet representable.
+struct SafariBrowserSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        SFSafariViewController(url: url)
+    }
+
+    func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
+}
 
 /// Every service's switches in one place, rather than one sheet at a time.
 struct AllSettingsTab: View {
@@ -36,44 +48,44 @@ struct AllSettingsTab: View {
     }
 }
 
-/// Settings: the publik account, sign-out for each service, privacy, and About
+/// Settings: sign-out for each service, privacy, and About
 /// (how blocking works, the rule versions, the source code, the app version).
 struct ProfileTab: View {
     @EnvironmentObject private var state: AppState
-    @EnvironmentObject private var gate: PublikGateModel
 
-    @State private var confirmSignOut = false
-    @State private var confirmDelete = false
-    /// A page in the in-app browser (help and support, the privacy policy, the source code), or nil.
-    @State private var webPage: PublikGateModel.BrowserPage?
+    struct BrowserPage: Identifiable {
+        let id = UUID()
+        let url: URL
+    }
+    /// A page in the in-app Safari browser (source code, help, etc.), or nil.
+    @State private var webPage: BrowserPage?
 
     static let sourceCodeURL = URL(string: "https://github.com/Blueturboguy07/noscroll")!
+    static let supportURL = URL(string: "https://github.com/Blueturboguy07/noscroll/issues")!
 
     var body: some View {
         NavigationStack {
             List {
-                publikSection
                 servicesSection
 
                 Section {
-                    // publik's bare in-app support page, in the in-app browser.
-                    Button("Help and support") { webPage = PublikGateModel.BrowserPage(url: Publik.supportURL) }
+                    Button("Help and support") { webPage = BrowserPage(url: Self.supportURL) }
                 } header: {
                     Text("Help")
                 }
 
                 Section {
-                    Button("Privacy policy") { webPage = PublikGateModel.BrowserPage(url: Publik.privacyURL) }
+                    // Privacy statement in footer
                 } header: {
                     Text("Privacy")
                 } footer: {
-                    Text("Blocking runs on this iPhone. \(AppState.appName) sends nothing about what you look at. Your logins for the services stay in \(AppState.appName) on this iPhone.")
+                    Text("Blocking runs completely on this iPhone. \(AppState.appName) sends nothing about what you look at. Your logins for the services stay in \(AppState.appName) on this iPhone.")
                 }
 
                 Section {
                     NavigationLink("How blocking works") { HowBlockingWorksView() }
                     NavigationLink("Blocking rules") { RuleDetailsView() }
-                    Button("Source code") { webPage = PublikGateModel.BrowserPage(url: Self.sourceCodeURL) }
+                    Button("Source code") { webPage = BrowserPage(url: Self.sourceCodeURL) }
                     Text(AppState.versionLine)
                         .foregroundStyle(.secondary)
                         .accessibilityLabel("Version: \(AppState.versionLine)")
@@ -84,61 +96,9 @@ struct ProfileTab: View {
                 }
             }
             .navigationTitle("Settings")
-            .sheet(isPresented: $gate.signInSheet) {
-                PublikGateView(model: gate)
-            }
         }
-        // Delete account, step 3: publik's delete page in the in-app browser.
-        .sheet(item: $gate.deletePage, onDismiss: { gate.finishDelete() }) { page in
-            PublikBrowser(url: page.url).ignoresSafeArea()
-        }
-        // Help and support, the privacy policy and the source code: in the in-app browser, not the Safari app.
         .sheet(item: $webPage) { page in
-            PublikBrowser(url: page.url).ignoresSafeArea()
-        }
-        .confirmationDialog("Sign out of publik?", isPresented: $confirmSignOut, titleVisibility: .visible) {
-            Button("Sign out", role: .destructive) { gate.signOut() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(signOutMessage)
-        }
-        // Delete account, step 1: say what is deleted.
-        .alert("Delete your publik account?", isPresented: $confirmDelete) {
-            Button("Delete account", role: .destructive) { gate.deleteAccount() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This deletes your publik account for all publik apps, not only for \(AppState.appName). First, \(AppState.appName) signs you out and deletes its publik data on this iPhone. Then the publik page opens. Confirm the deletion on that page.")
-        }
-    }
-
-    private var signOutMessage: String {
-        gate.mode == .required
-            ? "\(AppState.appName) asks you to sign in with publik again before you can use it."
-            : "The app stops telling publik about app use until you sign in again."
-    }
-
-    private var publikSection: some View {
-        Section {
-            if gate.signedIn {
-                // The account email when publik gives one; else the handle; else no name at all.
-                if let email = gate.email {
-                    LabeledContent("Signed in as", value: email)
-                } else if let handle = gate.handle {
-                    LabeledContent("Signed in as", value: "@\(handle)")
-                } else {
-                    Text("Signed in with publik")
-                }
-                Button("Sign out", role: .destructive) { confirmSignOut = true }
-                // Only with an account: usage counting and account deletion.
-                Toggle("Count app use", isOn: $gate.usageCounting)
-                Button("Delete account", role: .destructive) { confirmDelete = true }
-            } else {
-                Button("Sign in with publik") { gate.signInSheet = true }
-            }
-        } header: {
-            Text("publik account")
-        } footer: {
-            Text(gate.signedIn ? "\(AppState.appName) tells publik when it opens and each 30 minutes that it stays open, so publik can count app use. It sends nothing about what you look at. Turn off Count app use to stop this." : "When you are signed in, \(AppState.appName) tells publik when it opens and each 30 minutes that it stays open, so publik can count app use. It sends nothing about what you look at. After you sign in, you can turn this off here (Count app use).")
+            SafariBrowserSheet(url: page.url).ignoresSafeArea()
         }
     }
 

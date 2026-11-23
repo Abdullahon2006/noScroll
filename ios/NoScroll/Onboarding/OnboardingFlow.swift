@@ -114,7 +114,8 @@ enum LayoutProbe {
     nonisolated(unsafe) private static var started = false
 
     static func start() {
-        guard !started, Publik.hook("PUBLIK_LAYOUT_PROBE") != nil else { return }
+        let hook = ProcessInfo.processInfo.environment["PUBLIK_LAYOUT_PROBE"] ?? UserDefaults.standard.string(forKey: "PUBLIK_LAYOUT_PROBE")
+        guard !started, hook != nil else { return }
         started = true
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_500_000_000)

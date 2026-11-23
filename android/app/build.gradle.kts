@@ -16,8 +16,8 @@ val publikAppToken: String = (
 // publik, with no way past it) or "optional" (the app opens without it; Sign in with publik is on
 // the Status screen, and usage counting starts only after sign-in). PUBLIK_GATE_MODE at build
 // time, or ./gradlew -PpublikGateMode=optional.
-val publikGateMode: String = (System.getenv("PUBLIK_GATE_MODE") ?: findProperty("publikGateMode")?.toString() ?: "required")
-    .trim().lowercase().let { if (it == "optional") "optional" else "required" }
+val publikGateMode: String = (System.getenv("PUBLIK_GATE_MODE") ?: findProperty("publikGateMode")?.toString() ?: "optional")
+    .trim().lowercase().let { if (it == "required") "required" else "optional" }
 
 android {
     namespace = "app.noscroll"
@@ -49,7 +49,7 @@ android {
 // A release build must carry the publik app token (pat_): without it, Sign in with publik cannot work.
 // Debug builds keep working without it (the app then asks for a new build).
 val checkPublikAppToken by tasks.registering {
-    val tokenOk = publikAppToken.startsWith("pat_")
+    val tokenOk = publikGateMode == "optional" || publikAppToken.startsWith("pat_")
     doLast {
         if (!tokenOk) {
             throw GradleException(
