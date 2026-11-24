@@ -93,41 +93,180 @@ final class WrappedWebViewController: UIViewController {
 
         let nativeTouchStyleScript = """
         (function() {
-            var h = (location.hostname || '').toLowerCase();
-            var p = (location.pathname || '').toLowerCase();
-            if (h === 'appleid.apple.com' || h === 'accounts.google.com' || h === 'consent.google.com' ||
-                h === 'accounts.youtube.com' || h === 'login.microsoftonline.com' ||
-                h.endsWith('.accounts.google.com') ||
-                p.startsWith('/accounts/') || p.startsWith('/challenge/') || p.startsWith('/oauth/') ||
-                p.startsWith('/signin') || p.startsWith('/login') || p.startsWith('/emailsignup') ||
-                p.startsWith('/recover') || p.startsWith('/two_factor') || p.startsWith('/2fa') ||
-                p.startsWith('/verify')) {
-                return;
+            function isAuth() {
+                if (document.querySelector('input[type="password"]')) return true;
+                var h = (location.hostname || '').toLowerCase();
+                var p = (location.pathname || '').toLowerCase();
+                if (h === 'appleid.apple.com' || h === 'accounts.google.com' || h === 'consent.google.com' ||
+                    h === 'accounts.youtube.com' || h === 'login.microsoftonline.com' ||
+                    h.endsWith('.accounts.google.com')) return true;
+                return /^\\/(accounts|challenge|oauth|signin|login|emailsignup|recover|two_factor|2fa|verify|dialog\\/oauth|checkpoint|two_step_verification|cookie\\/consent|servicelogin)/i.test(p);
             }
-            if (document.getElementById('noscroll-native-touch')) return;
-            var style = document.createElement('style');
-            style.id = 'noscroll-native-touch';
-            style.textContent = `
-                * {
-                    -webkit-tap-highlight-color: transparent !important;
+
+            function syncStyle() {
+                var el = document.getElementById('noscroll-native-feel');
+                if (isAuth()) {
+                    if (el) el.remove();
+                    return;
                 }
-                nav, header, footer, [role="navigation"], [role="tablist"], [role="button"], button {
-                    -webkit-touch-callout: none !important;
+                if (el) return;
+
+                var h = (location.hostname || '').toLowerCase();
+                var css = `
+                    * {
+                        -webkit-tap-highlight-color: transparent !important;
+                    }
+                    nav, header, footer, [role="navigation"], [role="tablist"], [role="button"], button {
+                        -webkit-touch-callout: none !important;
+                    }
+                `;
+                // Scope Instagram app-banner hiding strictly to instagram.com
+                if (h.indexOf('instagram.com') !== -1) {
+                    css += `
+                        div:has(> a[href*="app.adjust.com"]),
+                        div:has(> a[href*="apps.apple.com"]),
+                        div:has(> a[href*="play.google.com"]),
+                        div:has(> a[href^="instagram://"]),
+                        div[role="banner"]:has(a[href*="instagram.com/download"]),
+                        [data-testid="mobile-app-upsell"],
+                        header a[href*="app.adjust.com"],
+                        nav a[href*="app.adjust.com"],
+                        header a[href*="apps.apple.com"] {
+                            display: none !important;
+                        }
+                    `;
                 }
-            `;
-            var target = document.head || document.documentElement;
-            if (target) {
-                target.appendChild(style);
-            } else {
-                document.addEventListener('DOMContentLoaded', function() {
-                    var t = document.head || document.documentElement;
-                    if (t && !document.getElementById('noscroll-native-touch')) t.appendChild(style);
-                });
+
+                var style = document.createElement('style');
+                style.id = 'noscroll-native-feel';
+                style.textContent = css;
+                var target = document.head || document.documentElement;
+                if (target) target.appendChild(style);
+            }
+
+            // Sync on init and SPA navigation
+            syncStyle();
+            window.addEventListener('popstate', syncStyle);
+            var origPush = history.pushState;
+            var origReplace = history.replaceState;
+            if (origPush) {
+                history.pushState = function() {
+                    var ret = origPush.apply(this, arguments);
+                    syncStyle();
+                    return ret;
+                };
+            }
+            if (origReplace) {
+                history.replaceState = function() {
+                    var ret = origReplace.apply(this, arguments);
+                    syncStyle();
+                    return ret;
+                };
             }
         })();
         """
         controller.addUserScript(WKUserScript(source: nativeTouchStyleScript,
                                               injectionTime: .atDocumentStart,
+                                              forMainFrameOnly: true))
+
+        let popupDismissScript = """
+        (function() {
+            var h = (location.hostname || '').toLowerCase();
+            // Run DOM dismissal exclusively on instagram.com main frame
+            if (h.indexOf('instagram.com') === -1) return;
+
+            function isAuth() {
+                if (document.querySelector('input[type="password"]')) return true;
+                var p = (location.pathname || '').toLowerCase();
+                return /^\\/(accounts|challenge|oauth|signin|login|emailsignup|recover|two_factor|2fa|verify|dialog\\/oauth|checkpoint|two_step_verification|cookie\\/consent|servicelogin)/i.test(p);
+            }
+
+            var rafPending = false;
+            function autoDismissPrompts() {
+                rafPending = false;
+                if (isAuth()) return;
+
+                var dialogs = document.querySelectorAll('div[role="dialog"]');
+                for (var i = 0; i < dialogs.length; i++) {
+                    var dialog = dialogs[i];
+                    if (dialog.dataset.noscrollDismissed) continue;
+
+                    var text = dialog.textContent || '';
+                    // 1. "Turn on Notifications" modal nag -> safely click "Not Now"
+                    if (text.indexOf('Turn on Notifications') !== -1) {
+                        var buttons = dialog.querySelectorAll('button');
+                        for (var j = 0; j < buttons.length; j++) {
+                            var btnText = (buttons[j].textContent || '').trim().toLowerCase();
+                            if (btnText === 'not now') {
+                                dialog.dataset.noscrollDismissed = '1';
+                                buttons[j].click();
+                                break;
+                            }
+                        }
+                    }
+                    // 2. "Open in the Instagram app" / "Experience the best version" bottom sheet -> click close
+                    else if (text.indexOf('Open in the Instagram app') !== -1 ||
+                             text.indexOf('Experience the best version') !== -1) {
+                        var closeBtn = dialog.querySelector('button[aria-label="Close"], svg[aria-label="Close"]');
+                        if (closeBtn) {
+                            var clickable = closeBtn.closest('button') || closeBtn;
+                            if (clickable && typeof clickable.click === 'function') {
+                                dialog.dataset.noscrollDismissed = '1';
+                                clickable.click();
+                            }
+                        }
+                    }
+                    // Note: Never intercept or auto-click "Save Your Login Info" — users need their session saved!
+                }
+            }
+
+            function scheduleDismiss() {
+                if (rafPending || isAuth()) return;
+                rafPending = true;
+                requestAnimationFrame(autoDismissPrompts);
+            }
+
+            var observer = null;
+            function syncObserver() {
+                if (isAuth()) {
+                    if (observer) {
+                        observer.disconnect();
+                        observer = null;
+                    }
+                    return;
+                }
+                if (!observer && window.MutationObserver) {
+                    observer = new MutationObserver(function() {
+                        scheduleDismiss();
+                    });
+                    var root = document.documentElement || document.body;
+                    if (root) observer.observe(root, { childList: true, subtree: true });
+                }
+                scheduleDismiss();
+            }
+
+            syncObserver();
+            window.addEventListener('popstate', syncObserver);
+            var origPush = history.pushState;
+            var origReplace = history.replaceState;
+            if (origPush) {
+                history.pushState = function() {
+                    var ret = origPush.apply(this, arguments);
+                    syncObserver();
+                    return ret;
+                };
+            }
+            if (origReplace) {
+                history.replaceState = function() {
+                    var ret = origReplace.apply(this, arguments);
+                    syncObserver();
+                    return ret;
+                };
+            }
+        })();
+        """
+        controller.addUserScript(WKUserScript(source: popupDismissScript,
+                                              injectionTime: .atDocumentEnd,
                                               forMainFrameOnly: true))
 
         let cfg = WKWebViewConfiguration()
@@ -225,10 +364,14 @@ final class WrappedWebViewController: UIViewController {
     private func checkAuthSurface(for url: URL?) {
         guard let url = url, let host = url.host?.lowercased() else { return }
         let path = url.path.lowercased()
-        let isAuthHost = ServiceLinks.signInHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
+        let isAuthHost = host == "accounts.youtube.com" ||
+                         ServiceLinks.signInHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
         let isAuthPath = path.hasPrefix("/accounts/") || path.hasPrefix("/challenge/") || path.hasPrefix("/oauth/") ||
                          path.hasPrefix("/signin") || path.hasPrefix("/login") || path.hasPrefix("/emailsignup") ||
-                         path.hasPrefix("/two_factor") || path.hasPrefix("/2fa") || path.hasPrefix("/recover")
+                         path.hasPrefix("/two_factor") || path.hasPrefix("/2fa") || path.hasPrefix("/recover") ||
+                         path.hasPrefix("/dialog/oauth") || path.hasPrefix("/checkpoint") ||
+                         path.hasPrefix("/two_step_verification") || path.hasPrefix("/cookie/consent") ||
+                         path.hasPrefix("/servicelogin")
         if isAuthHost || isAuthPath {
             onBridge(.authSurface(active: true))
         }
