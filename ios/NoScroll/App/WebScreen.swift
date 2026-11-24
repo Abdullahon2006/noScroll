@@ -7,13 +7,14 @@ struct WebScreen: View {
 
     @EnvironmentObject private var state: AppState
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var navBridge = WebNavigationBridge()
     @State private var authSurfaceActive = false
     @State private var showPausedInfo = false
+    @State private var isKeyboardVisible = false
 
     var body: some View {
         NavigationStack {
             container
-                .ignoresSafeArea(edges: .bottom)
                 // Tell the user plainly that we have stepped back on their login page. It is the moment
                 // they are most likely to suspect a wrapper of phishing them. One sign for every service:
                 // a bar under the title with a short label, 44 pt high, that explains itself on a tap.
@@ -24,14 +25,104 @@ struct WebScreen: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
-                        Button("Done") { dismiss() }
+                        Button {
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "xmark")
+                                    .font(.body.weight(.bold))
+                                Text("Done")
+                                    .font(Theme.body(15, .semibold))
+                            }
+                            .foregroundStyle(Theme.ink)
+                        }
+                        .accessibilityLabel("Done")
+                        .accessibilityShowsLargeContentViewer()
+                    }
+
+                    if !isKeyboardVisible {
+                        ToolbarItemGroup(placement: .bottomBar) {
+                            Button {
+                                navBridge.goBack()
+                            } label: {
+                                Image(systemName: "chevron.backward")
+                                    .font(.body.weight(.semibold))
+                            }
+                            .disabled(!navBridge.canGoBack)
+                            .accessibilityLabel("Go back")
+                            .accessibilityShowsLargeContentViewer()
+
+                            Spacer()
+
+                            Button {
+                                navBridge.goForward()
+                            } label: {
+                                Image(systemName: "chevron.forward")
+                                    .font(.body.weight(.semibold))
+                            }
+                            .disabled(!navBridge.canGoForward)
+                            .accessibilityLabel("Go forward")
+                            .accessibilityShowsLargeContentViewer()
+
+                            Spacer()
+
+                            Button {
+                                navBridge.goHome()
+                            } label: {
+                                Image(systemName: "house")
+                                    .font(.body.weight(.semibold))
+                            }
+                            .disabled(authSurfaceActive)
+                            .accessibilityLabel("Go to \(service.name) home")
+                            .accessibilityShowsLargeContentViewer()
+
+                            Spacer()
+
+                            if let currentURL = navBridge.currentURL,
+                               !authSurfaceActive,
+                               let scheme = currentURL.scheme?.lowercased(),
+                               scheme == "http" || scheme == "https" {
+                                ShareLink(item: currentURL) {
+                                    Image(systemName: "square.and.arrow.up")
+                                        .font(.body.weight(.semibold))
+                                }
+                                .accessibilityLabel("Share link")
+                                .accessibilityShowsLargeContentViewer()
+                            } else {
+                                Button {} label: {
+                                    Image(systemName: "square.and.arrow.up")
+                                        .font(.body.weight(.semibold))
+                                }
+                                .disabled(true)
+                                .accessibilityLabel("Share link")
+                                .accessibilityShowsLargeContentViewer()
+                            }
+
+                            Spacer()
+
+                            Button {
+                                navBridge.reload()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.body.weight(.semibold))
+                            }
+                            .accessibilityLabel("Reload page")
+                            .accessibilityShowsLargeContentViewer()
+                        }
                     }
                 }
+                .tint(Theme.ink)
                 .alert("\(AppState.homeScreenName) is paused", isPresented: $showPausedInfo) {
                     Button("OK", role: .cancel) {}
                 } message: {
                     Text("This is a sign-in page. \(AppState.appName) does not hide, read or change anything on it. Blocking starts again after you sign in.")
                 }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            isKeyboardVisible = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            isKeyboardVisible = false
         }
         .onAppear { state.didOpen(service) }
     }
@@ -70,6 +161,7 @@ struct WebScreen: View {
                 engineSource: state.engineSource,
                 bundleRaw: raw,
                 settings: state.settings,
+                navBridge: navBridge,
                 onAuthSurface: { authSurfaceActive = $0 }
             )
         } else {
@@ -88,6 +180,7 @@ struct WebViewContainer: UIViewControllerRepresentable {
     let engineSource: String
     let bundleRaw: Data
     let settings: [String: Bool]
+    let navBridge: WebNavigationBridge
     let onAuthSurface: (Bool) -> Void
 
     func makeUIViewController(context: Context) -> WrappedWebViewController {
@@ -104,6 +197,7 @@ struct WebViewContainer: UIViewControllerRepresentable {
             // the bridge terminates in the native shell — so this is local
             // logging, not telemetry in the sense docs/PRIVACY.md disclaims.
             telemetry: isDebugBuild,
+            navBridge: navBridge,
             onBridge: { message in
                 #if DEBUG
                 // Wiring proof: shows the engine really is running inside this
@@ -123,7 +217,9 @@ struct WebViewContainer: UIViewControllerRepresentable {
         )
     }
 
-    func updateUIViewController(_ controller: WrappedWebViewController, context: Context) {}
+    func updateUIViewController(_ controller: WrappedWebViewController, context: Context) {
+        controller.updateNavBridge(navBridge)
+    }
 }
 
 /// True only in DEBUG builds. Used to switch on local diagnostic logging.
