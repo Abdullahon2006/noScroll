@@ -49,6 +49,7 @@ export function enableIsolation(opts: IsolateOptions): void {
   if (active) return;
   active = true;
   const threshold = opts.threshold ?? 24;
+  let startX = 0;
   let startY = 0;
   let fired = false;
 
@@ -63,21 +64,37 @@ export function enableIsolation(opts: IsolateOptions): void {
   };
 
   const onTouchStart = (e: TouchEvent) => {
+    startX = e.touches[0]?.clientX ?? 0;
     startY = e.touches[0]?.clientY ?? 0;
     fired = false;
   };
   const onTouchMove = (e: TouchEvent) => {
+    const x = e.touches[0]?.clientX ?? 0;
     const y = e.touches[0]?.clientY ?? 0;
-    if (Math.abs(y - startY) > threshold) {
+    const dx = Math.abs(x - startX);
+    const dy = startY - y; // positive when swiping up
+
+    // Horizontal gestures (swipe-back navigation, scrubbers): do not intercept
+    if (dx > Math.abs(dy)) return;
+
+    // Swiping up advances to the next reel/short -> intercept and fire onAdvance
+    if (dy > threshold) {
       stop(e);
       fire();
-    } else {
+    } else if (dy < -threshold && (window.scrollY || document.documentElement.scrollTop) > 0) {
+      // Swiping down when scrolled down -> intercept and fire onAdvance
       stop(e);
+      fire();
+    } else if (dy <= 0) {
+      // Downward pull at top: allow native pull-to-refresh and bounce without suppression
+      return;
     }
   };
   const onWheel = (e: WheelEvent) => {
-    stop(e);
-    if (Math.abs(e.deltaY) > 4) fire();
+    if (e.deltaY > 4) {
+      stop(e);
+      fire();
+    }
   };
   const onKey = (e: KeyboardEvent) => {
     if (!ADVANCE_KEYS.has(e.key)) return;
@@ -99,11 +116,11 @@ export function enableIsolation(opts: IsolateOptions): void {
   add('wheel', onWheel);
   add('keydown', onKey);
 
-  // Kill scroll-snap paging and overflow scrolling at the document level.
+  // Kill scroll-snap paging, but allow vertical overscroll for pull-to-refresh.
   const style = document.createElement('style');
   style.setAttribute('data-noscroll', 'isolation');
   style.textContent = `
-    html, body { overflow: hidden !important; overscroll-behavior: none !important; }
+    html, body { overflow: hidden !important; overscroll-behavior-y: auto !important; }
     * { scroll-snap-type: none !important; }
   `;
   document.documentElement.appendChild(style);

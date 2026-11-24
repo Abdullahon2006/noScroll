@@ -21,6 +21,9 @@ final class WrappedWebViewController: UIViewController {
 
     private var webView: WKWebView!
     private var restorationState: Data?
+    private var refreshControl: UIRefreshControl?
+    private var progressView: UIProgressView!
+    private var progressObservation: NSKeyValueObservation?
 
     init(session: WebSession,
          startURL: URL,
@@ -61,6 +64,45 @@ final class WrappedWebViewController: UIViewController {
                                               forMainFrameOnly: false))
         controller.add(BridgeHandler(onBridge), name: "noscroll")
 
+        let nativeTouchStyleScript = """
+        (function() {
+            var h = (location.hostname || '').toLowerCase();
+            var p = (location.pathname || '').toLowerCase();
+            if (h === 'appleid.apple.com' || h === 'accounts.google.com' || h === 'consent.google.com' ||
+                h === 'accounts.youtube.com' || h === 'login.microsoftonline.com' ||
+                h.endsWith('.accounts.google.com') ||
+                p.startsWith('/accounts/') || p.startsWith('/challenge/') || p.startsWith('/oauth/') ||
+                p.startsWith('/signin') || p.startsWith('/login') || p.startsWith('/emailsignup') ||
+                p.startsWith('/recover') || p.startsWith('/two_factor') || p.startsWith('/2fa') ||
+                p.startsWith('/verify')) {
+                return;
+            }
+            if (document.getElementById('noscroll-native-touch')) return;
+            var style = document.createElement('style');
+            style.id = 'noscroll-native-touch';
+            style.textContent = `
+                * {
+                    -webkit-tap-highlight-color: transparent !important;
+                }
+                nav, header, footer, [role="navigation"], [role="tablist"], [role="button"], button {
+                    -webkit-touch-callout: none !important;
+                }
+            `;
+            var target = document.head || document.documentElement;
+            if (target) {
+                target.appendChild(style);
+            } else {
+                document.addEventListener('DOMContentLoaded', function() {
+                    var t = document.head || document.documentElement;
+                    if (t && !document.getElementById('noscroll-native-touch')) t.appendChild(style);
+                });
+            }
+        })();
+        """
+        controller.addUserScript(WKUserScript(source: nativeTouchStyleScript,
+                                              injectionTime: .atDocumentStart,
+                                              forMainFrameOnly: true))
+
         let cfg = WKWebViewConfiguration()
         cfg.userContentController = controller
         cfg.websiteDataStore = dataStore
@@ -91,16 +133,110 @@ final class WrappedWebViewController: UIViewController {
 
     // MARK: - Lifecycle
 
-    override func loadView() { view = webView }
+    override func loadView() {
+        let container = UIView()
+        container.backgroundColor = .systemBackground
+
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(webView)
+
+        progressView = UIProgressView(progressViewStyle: .bar)
+        progressView.translatesAutoresizingMaskIntoConstraints = false
+        progressView.progressTintColor = UIColor(red: 20/255.0, green: 20/255.0, blue: 20/255.0, alpha: 1.0)
+        progressView.trackTintColor = .clear
+        progressView.alpha = 0.0
+        container.addSubview(progressView)
+
+        NSLayoutConstraint.activate([
+            webView.topAnchor.constraint(equalTo: container.topAnchor),
+            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            progressView.topAnchor.constraint(equalTo: container.safeAreaLayoutGuide.topAnchor),
+            progressView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            progressView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            progressView.heightAnchor.constraint(equalToConstant: 2.5)
+        ])
+
+        view = container
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         configureAudioSession()
+        setupRefreshControl()
+        setupProgressObserver()
         restoreOrLoad()
 
         NotificationCenter.default.addObserver(
             self, selector: #selector(saveState),
-            name: UIApplication.didEnterBackgroundNotification, object: nil)
+            name: UIApplication.didEnterBackgroundNotification, object: nil
+        )
+    }
+
+    private func setupRefreshControl() {
+        let refresh = UIRefreshControl()
+        refresh.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
+        webView.scrollView.refreshControl = refresh
+        self.refreshControl = refresh
+    }
+
+    @objc private func handleRefresh() {
+        guard let url = webView.url,
+              let host = url.host,
+              !host.isEmpty,
+              url.absoluteString != "about:blank" else {
+            webView.load(URLRequest(url: homeURL()))
+            return
+        }
+        webView.reload()
+    }
+
+    private func setupProgressObserver() {
+        progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.updateProgress(Float(webView.estimatedProgress))
+            }
+        }
+    }
+
+    private func updateProgress(_ progress: Float) {
+        if progress >= 1.0 {
+            progressView.setProgress(1.0, animated: true)
+            UIView.animate(withDuration: 0.25, delay: 0.1, options: .curveEaseOut, animations: { [weak self] in
+                self?.progressView.alpha = 0.0
+            }, completion: { [weak self] _ in
+                guard let self = self else { return }
+                if self.progressView.alpha == 0.0 {
+                    self.progressView.setProgress(0.0, animated: false)
+                }
+            })
+        } else if progress > 0.0 {
+            progressView.layer.removeAllAnimations()
+            progressView.alpha = 1.0
+            progressView.setProgress(progress, animated: true)
+        }
+    }
+
+    private func dismissProgress() {
+        if progressView.alpha > 0.0 {
+            progressView.layer.removeAllAnimations()
+            UIView.animate(withDuration: 0.2, animations: {
+                self.progressView.alpha = 0.0
+            }, completion: { [weak self] _ in
+                guard let self = self else { return }
+                if self.progressView.alpha == 0.0 {
+                    self.progressView.setProgress(0.0, animated: false)
+                }
+            })
+        }
+    }
+
+    deinit {
+        progressObservation?.invalidate()
+        NotificationCenter.default.removeObserver(self)
     }
 
     /// Video that plays silently unless the ringer is on is an audio-session
@@ -152,47 +288,56 @@ final class WrappedWebViewController: UIViewController {
     }
 }
 
-// MARK: - Navigation
+// MARK: - Navigation delegate
 
 extension WrappedWebViewController: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-
         guard let url = navigationAction.request.url else {
-            decisionHandler(.allow); return
-        }
-
-        // Cancel app-scheme navigations. Instagram's web pages try hard to hand
-        // off to the native app; since we have that app shielded, following the
-        // link would eject the user into a shield screen mid-flow and look like
-        // the wrapper crashed.
-        if let scheme = url.scheme?.lowercased(),
-           !["http", "https", "about", "data", "blob"].contains(scheme) {
-            decisionHandler(.cancel); return
-        }
-
-        // A page of another site (a link in a post, a profile's web site, a redirect of a link shim) opens in
-        // the in-app Safari sheet, not here: the web view shows only the service and its sign-in pages, so the
-        // app gives no unrestricted web access. Frames inside a page of the service are not checked.
-        let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
-        if mainFrame, !ServiceLinks.staysInApp(url, serviceDomains: serviceDomains) {
             decisionHandler(.cancel)
-            openOutside(url)
             return
         }
 
-        decisionHandler(.allow)
+        // Main frame only: iframes are ads or embeds, which stay in the web view.
+        guard navigationAction.targetFrame?.isMainFrame ?? true else {
+            decisionHandler(.allow)
+            return
+        }
+
+        // Internal navigation stays inside the web view.
+        if ServiceLinks.staysInApp(url, serviceDomains: serviceDomains) {
+            decisionHandler(.allow)
+            return
+        }
+
+        // An external link: cancel navigation in the web view and show it in the Safari sheet.
+        decisionHandler(.cancel)
+        openOutside(url)
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        progressView.layer.removeAllAnimations()
+        progressView.alpha = 1.0
+        progressView.setProgress(Float(webView.estimatedProgress), animated: true)
         saveState()
     }
 
-    /// A crashed WebView must recover, not sit blank.
-    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        restoreOrLoad()
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        dismissProgress()
+        refreshControl?.endRefreshing()
+        saveState()
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        dismissProgress()
+        refreshControl?.endRefreshing()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        dismissProgress()
+        refreshControl?.endRefreshing()
     }
 }
 
