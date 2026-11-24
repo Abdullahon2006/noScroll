@@ -4,6 +4,26 @@ import SafariServices
 import UIKit
 import WebKit
 
+/// State and action bridge between the UIKit web view controller and SwiftUI navigation controls.
+@MainActor
+public final class WebNavigationBridge: ObservableObject {
+    @Published public var canGoBack: Bool = false
+    @Published public var canGoForward: Bool = false
+    @Published public var currentURL: URL?
+
+    public var goBackAction: (() -> Void)?
+    public var goForwardAction: (() -> Void)?
+    public var reloadAction: (() -> Void)?
+    public var goHomeAction: (() -> Void)?
+
+    public init() {}
+
+    public func goBack() { goBackAction?() }
+    public func goForward() { goForwardAction?() }
+    public func reload() { reloadAction?() }
+    public func goHome() { goHomeAction?() }
+}
+
 /// The wrapped browser.
 ///
 /// Most of this file exists because of specific, documented failures in the app
@@ -18,12 +38,16 @@ final class WrappedWebViewController: UIViewController {
     private let settings: [String: Bool]
     private let telemetry: Bool
     private let onBridge: (BridgeMessage) -> Void
+    private weak var navBridge: WebNavigationBridge?
 
     private var webView: WKWebView!
     private var restorationState: Data?
     private var refreshControl: UIRefreshControl?
     private var progressView: UIProgressView!
     private var progressObservation: NSKeyValueObservation?
+    private var backObservation: NSKeyValueObservation?
+    private var forwardObservation: NSKeyValueObservation?
+    private var urlObservation: NSKeyValueObservation?
 
     init(session: WebSession,
          startURL: URL,
@@ -32,6 +56,7 @@ final class WrappedWebViewController: UIViewController {
          bundleRaw: Data,
          settings: [String: Bool],
          telemetry: Bool,
+         navBridge: WebNavigationBridge? = nil,
          onBridge: @escaping (BridgeMessage) -> Void) {
         self.session = session
         self.startURL = startURL
@@ -39,9 +64,11 @@ final class WrappedWebViewController: UIViewController {
         self.bundleRaw = bundleRaw
         self.settings = settings
         self.telemetry = telemetry
+        self.navBridge = navBridge
         self.onBridge = onBridge
         super.init(nibName: nil, bundle: nil)
         configure(dataStore: dataStore)
+        wireBridgeActions()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) unavailable") }
@@ -167,12 +194,67 @@ final class WrappedWebViewController: UIViewController {
         configureAudioSession()
         setupRefreshControl()
         setupProgressObserver()
+        setupNavigationObservers()
         restoreOrLoad()
 
         NotificationCenter.default.addObserver(
             self, selector: #selector(saveState),
             name: UIApplication.didEnterBackgroundNotification, object: nil
         )
+    }
+
+    private func setupNavigationObservers() {
+        backObservation = webView.observe(\.canGoBack, options: [.initial, .new]) { [weak self] webView, _ in
+            Task { @MainActor [weak self] in
+                self?.navBridge?.canGoBack = webView.canGoBack
+            }
+        }
+        forwardObservation = webView.observe(\.canGoForward, options: [.initial, .new]) { [weak self] webView, _ in
+            Task { @MainActor [weak self] in
+                self?.navBridge?.canGoForward = webView.canGoForward
+            }
+        }
+        urlObservation = webView.observe(\.url, options: [.initial, .new]) { [weak self] webView, _ in
+            Task { @MainActor [weak self] in
+                self?.navBridge?.currentURL = webView.url
+                self?.checkAuthSurface(for: webView.url)
+            }
+        }
+    }
+
+    private func checkAuthSurface(for url: URL?) {
+        guard let url = url, let host = url.host?.lowercased() else { return }
+        let path = url.path.lowercased()
+        let isAuthHost = ServiceLinks.signInHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
+        let isAuthPath = path.hasPrefix("/accounts/") || path.hasPrefix("/challenge/") || path.hasPrefix("/oauth/") ||
+                         path.hasPrefix("/signin") || path.hasPrefix("/login") || path.hasPrefix("/emailsignup") ||
+                         path.hasPrefix("/two_factor") || path.hasPrefix("/2fa") || path.hasPrefix("/recover")
+        if isAuthHost || isAuthPath {
+            onBridge(.authSurface(active: true))
+        }
+    }
+
+    private func wireBridgeActions() {
+        navBridge?.goBackAction = { [weak self] in
+            guard let self = self, self.webView.canGoBack else { return }
+            self.webView.goBack()
+        }
+        navBridge?.goForwardAction = { [weak self] in
+            guard let self = self, self.webView.canGoForward else { return }
+            self.webView.goForward()
+        }
+        navBridge?.reloadAction = { [weak self] in
+            self?.handleRefresh()
+        }
+        navBridge?.goHomeAction = { [weak self] in
+            guard let self = self else { return }
+            self.webView.load(URLRequest(url: self.homeURL()))
+        }
+    }
+
+    func updateNavBridge(_ bridge: WebNavigationBridge?) {
+        self.navBridge = bridge
+        wireBridgeActions()
     }
 
     private func setupRefreshControl() {
@@ -236,7 +318,18 @@ final class WrappedWebViewController: UIViewController {
 
     deinit {
         progressObservation?.invalidate()
+        backObservation?.invalidate()
+        forwardObservation?.invalidate()
+        urlObservation?.invalidate()
         NotificationCenter.default.removeObserver(self)
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                navBridge?.goBackAction = nil
+                navBridge?.goForwardAction = nil
+                navBridge?.reloadAction = nil
+                navBridge?.goHomeAction = nil
+            }
+        }
     }
 
     /// Video that plays silently unless the ringer is on is an audio-session
@@ -318,6 +411,7 @@ extension WrappedWebViewController: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        checkAuthSurface(for: webView.url)
         progressView.layer.removeAllAnimations()
         progressView.alpha = 1.0
         progressView.setProgress(Float(webView.estimatedProgress), animated: true)
