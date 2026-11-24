@@ -15,6 +15,7 @@ public final class WebNavigationBridge: ObservableObject {
     public var goForwardAction: (() -> Void)?
     public var reloadAction: (() -> Void)?
     public var goHomeAction: (() -> Void)?
+    public var navigateAction: ((URL) -> Void)?
 
     public init() {}
 
@@ -22,6 +23,7 @@ public final class WebNavigationBridge: ObservableObject {
     public func goForward() { goForwardAction?() }
     public func reload() { reloadAction?() }
     public func goHome() { goHomeAction?() }
+    public func navigate(to url: URL) { navigateAction?(url) }
 }
 
 /// The wrapped browser.
@@ -68,7 +70,6 @@ final class WrappedWebViewController: UIViewController {
         self.onBridge = onBridge
         super.init(nibName: nil, bundle: nil)
         configure(dataStore: dataStore)
-        wireBridgeActions()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) unavailable") }
@@ -285,7 +286,7 @@ final class WrappedWebViewController: UIViewController {
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
+        webView.scrollView.contentInsetAdjustmentBehavior = .scrollableAxes
     }
 
     private func engineConfigJSON() -> String {
@@ -299,47 +300,48 @@ final class WrappedWebViewController: UIViewController {
 
     // MARK: - Lifecycle
 
+    private let containerView = UIView()
+
     override func loadView() {
-        let container = UIView()
-        container.backgroundColor = .systemBackground
+        containerView.backgroundColor = .systemBackground
 
         webView.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(webView)
+        containerView.addSubview(webView)
 
         progressView = UIProgressView(progressViewStyle: .bar)
         progressView.translatesAutoresizingMaskIntoConstraints = false
-        progressView.progressTintColor = UIColor(red: 20/255.0, green: 20/255.0, blue: 20/255.0, alpha: 1.0)
+        progressView.tintColor = .tintColor
         progressView.trackTintColor = .clear
-        progressView.alpha = 0.0
-        container.addSubview(progressView)
+        progressView.alpha = 0
+        containerView.addSubview(progressView)
 
         NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: container.topAnchor),
-            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            webView.topAnchor.constraint(equalTo: containerView.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
+            webView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
 
-            progressView.topAnchor.constraint(equalTo: container.safeAreaLayoutGuide.topAnchor),
-            progressView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            progressView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            progressView.topAnchor.constraint(equalTo: containerView.topAnchor),
+            progressView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            progressView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
             progressView.heightAnchor.constraint(equalToConstant: 2.5)
         ])
 
-        view = container
+        view = containerView
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        configureAudioSession()
         setupRefreshControl()
         setupProgressObserver()
         setupNavigationObservers()
+        wireBridgeActions()
+        configureAudioSession()
         restoreOrLoad()
 
         NotificationCenter.default.addObserver(
             self, selector: #selector(saveState),
-            name: UIApplication.didEnterBackgroundNotification, object: nil
-        )
+            name: UIApplication.didEnterBackgroundNotification, object: nil)
     }
 
     private func setupNavigationObservers() {
@@ -392,6 +394,10 @@ final class WrappedWebViewController: UIViewController {
         navBridge?.goHomeAction = { [weak self] in
             guard let self = self else { return }
             self.webView.load(URLRequest(url: self.homeURL()))
+        }
+        navBridge?.navigateAction = { [weak self] url in
+            guard let self = self else { return }
+            self.webView.load(URLRequest(url: url))
         }
     }
 
@@ -446,8 +452,8 @@ final class WrappedWebViewController: UIViewController {
     }
 
     private func dismissProgress() {
-        if progressView.alpha > 0.0 {
-            progressView.layer.removeAllAnimations()
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
             UIView.animate(withDuration: 0.2, animations: {
                 self.progressView.alpha = 0.0
             }, completion: { [weak self] _ in
@@ -471,6 +477,7 @@ final class WrappedWebViewController: UIViewController {
                 navBridge?.goForwardAction = nil
                 navBridge?.reloadAction = nil
                 navBridge?.goHomeAction = nil
+                navBridge?.navigateAction = nil
             }
         }
     }
@@ -487,11 +494,20 @@ final class WrappedWebViewController: UIViewController {
     /// white screen and forces a restart — which blocks login entirely. That is
     /// the worst failure of a wrapped web app, because the user cannot get past it.
     private func restoreOrLoad() {
+        if isDeepLink {
+            webView.load(URLRequest(url: startURL))
+            return
+        }
         if let state = restorationState ?? UserDefaults.standard.data(forKey: stateKey) {
             webView.interactionState = state
             return
         }
         webView.load(URLRequest(url: homeURL()))
+    }
+
+    private var isDeepLink: Bool {
+        let p = startURL.path
+        return !p.isEmpty && p != "/"
     }
 
     private var stateKey: String { "noscroll.state.\(session.id.uuidString)" }
@@ -503,10 +519,10 @@ final class WrappedWebViewController: UIViewController {
         }
     }
 
-    /// Supplied by the caller from the service definition. It used to be a
-    /// switch over two hardcoded cases with `default: instagram`, which sent
-    /// all six other services to Instagram.
-    private func homeURL() -> URL { startURL }
+    /// Supplied by the caller from the service definition.
+    private func homeURL() -> URL {
+        URL(string: "\(startURL.scheme ?? "https")://\(startURL.host ?? "www.instagram.com")/") ?? startURL
+    }
 
     /// The service's own domains, from the `match` patterns of its rule bundle (ServiceLinks, NoScrollCore).
     private lazy var serviceDomains: [String] = {
@@ -524,57 +540,91 @@ final class WrappedWebViewController: UIViewController {
     }
 }
 
-// MARK: - Navigation delegate
+// MARK: - Navigation
 
 extension WrappedWebViewController: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+
         guard let url = navigationAction.request.url else {
+            decisionHandler(.allow); return
+        }
+
+        // Cancel app-scheme navigations. Instagram's web pages try hard to hand
+        // off to the native app; since we have that app shielded, following the
+        // link would eject the user into a shield screen mid-flow and look like
+        // the wrapper crashed.
+        if let scheme = url.scheme?.lowercased(),
+           !["http", "https", "about", "data", "blob"].contains(scheme) {
+            decisionHandler(.cancel); return
+        }
+
+        // A page of another site (a link in a post, a profile's web site, a redirect of a link shim) opens in
+        // the in-app Safari sheet, not here: the web view shows only the service and its sign-in pages, so the
+        // app gives no unrestricted web access. Frames inside a page of the service are not checked.
+        let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+        if mainFrame, !ServiceLinks.staysInApp(url, serviceDomains: serviceDomains) {
             decisionHandler(.cancel)
+            openOutside(url)
             return
         }
 
-        // Main frame only: iframes are ads or embeds, which stay in the web view.
-        guard navigationAction.targetFrame?.isMainFrame ?? true else {
-            decisionHandler(.allow)
-            return
-        }
-
-        // Internal navigation stays inside the web view.
-        if ServiceLinks.staysInApp(url, serviceDomains: serviceDomains) {
-            decisionHandler(.allow)
-            return
-        }
-
-        // An external link: cancel navigation in the web view and show it in the Safari sheet.
-        decisionHandler(.cancel)
-        openOutside(url)
+        decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         checkAuthSurface(for: webView.url)
-        progressView.layer.removeAllAnimations()
-        progressView.alpha = 1.0
-        progressView.setProgress(Float(webView.estimatedProgress), animated: true)
-        saveState()
+        Task { @MainActor [weak self] in
+            self?.navBridge?.canGoBack = webView.canGoBack
+            self?.navBridge?.canGoForward = webView.canGoForward
+            self?.navBridge?.currentURL = webView.url
+        }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        dismissProgress()
         refreshControl?.endRefreshing()
+        dismissProgress()
+        Task { @MainActor [weak self] in
+            self?.navBridge?.canGoBack = webView.canGoBack
+            self?.navBridge?.canGoForward = webView.canGoForward
+            self?.navBridge?.currentURL = webView.url
+        }
         saveState()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        dismissProgress()
         refreshControl?.endRefreshing()
+        dismissProgress()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        dismissProgress()
         refreshControl?.endRefreshing()
+        dismissProgress()
+
+        let nsError = error as NSError
+        let connectivityCodes: Set<Int> = [
+            NSURLErrorNotConnectedToInternet,
+            NSURLErrorTimedOut,
+            NSURLErrorCannotFindHost,
+            NSURLErrorCannotConnectToHost,
+            NSURLErrorNetworkConnectionLost,
+            NSURLErrorDNSLookupFailed,
+            NSURLErrorDataNotAllowed
+        ]
+        if nsError.domain == NSURLErrorDomain && connectivityCodes.contains(nsError.code) {
+            if let state = restorationState {
+                webView.interactionState = state
+            } else {
+                webView.load(URLRequest(url: homeURL()))
+            }
+        }
+    }
+
+    /// A crashed WebView must recover, not sit blank.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        restoreOrLoad()
     }
 }
 

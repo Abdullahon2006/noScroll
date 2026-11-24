@@ -74,16 +74,121 @@ final class AppState: ObservableObject {
 
     enum Tab: Hashable { case adjust, home, profile }
     @Published var tab: Tab = .home
-    /// Set by a widget tap; HomeView opens this service's browser.
-    @Published var pendingService: String?
 
-    /// noscroll://open/<service> — the widget's whole job.
+    /// An incoming navigation request from a deep link, universal link, or widget tap.
+    struct PendingNavigation: Equatable {
+        let serviceID: String
+        let url: URL?
+    }
+    @Published var pendingNavigation: PendingNavigation?
+
+    /// Backward compatibility helper for widget activations.
+    var pendingService: String? {
+        pendingNavigation?.serviceID
+    }
+
+    /// Finds a registered service by matching a domain or host name.
+    static func service(forHost host: String) -> Service? {
+        let h = host.lowercased()
+        if h == "youtu.be" { return service("youtube") }
+        for s in services {
+            if let sHost = s.home.host?.lowercased() {
+                if h == sHost || h.hasSuffix("." + sHost) {
+                    return s
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Normalizes Instagram URL paths: rewrites plural `/reels/<id>` to singular `/reel/<id>`
+    /// so it safely activates `isolated-player` instead of being blocked by `reels-route`.
+    static func normalizePath(forServiceID serviceID: String, path: String) -> String {
+        if serviceID == "instagram" {
+            let components = path.split(separator: "/", omittingEmptySubsequences: true)
+            if components.count >= 2 && components[0] == "reels" && components[1] != "audio" && components[1] != "video" {
+                let remainder = components.dropFirst().joined(separator: "/")
+                let trailing = path.hasSuffix("/") ? "/" : ""
+                return "/reel/" + remainder + trailing
+            }
+        }
+        return path
+    }
+
+    /// Handles incoming deep links and widget activations:
+    /// - `noscroll://open/<service>` (Widget tap)
+    /// - `noscroll://open/<service>?url=<encoded_url>` (Video edit or shared post/reel)
+    /// - `noscroll://open?url=<encoded_url>` (Infers service from target URL)
+    /// - `noscroll://instagram/p/<id>` or `noscroll://instagram/reel/<id>`
+    /// - Universal links or raw URLs with supported hosts
     func handle(url: URL) {
-        guard url.scheme == "noscroll", url.host == "open" else { return }
-        let id = url.lastPathComponent
-        guard Self.service(id) != nil else { return }
         tab = .home
-        pendingService = id
+        let scheme = (url.scheme ?? "").lowercased()
+
+        // 1. Raw HTTP/HTTPS link passed directly to the app
+        if scheme == "http" || scheme == "https" {
+            guard let host = url.host?.lowercased(),
+                  let service = Self.service(forHost: host) else { return }
+            var targetURL = url
+            let normPath = Self.normalizePath(forServiceID: service.id, path: url.path)
+            if normPath != url.path {
+                var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+                components?.path = normPath
+                targetURL = components?.url ?? url
+            }
+            pendingNavigation = PendingNavigation(serviceID: service.id, url: targetURL)
+            return
+        }
+
+        // 2. Custom scheme: noscroll://
+        guard scheme == "noscroll" else { return }
+        let host = (url.host ?? "").lowercased()
+
+        // Case A: noscroll://open/<service>?url=... or noscroll://open?url=...
+        if host == "open" {
+            var targetService = url.pathComponents.filter { $0 != "/" }.first
+            var extractedURL: URL?
+
+            if let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                if let queryURLString = components.queryItems?.first(where: { $0.name == "url" })?.value,
+                   let parsedURL = URL(string: queryURLString),
+                   let targetHost = parsedURL.host?.lowercased(),
+                   parsedURL.scheme?.lowercased() == "http" || parsedURL.scheme?.lowercased() == "https" {
+                    if let inferredService = Self.service(forHost: targetHost) {
+                        if targetService == nil || targetService == inferredService.id {
+                            targetService = inferredService.id
+                            var finalURL = parsedURL
+                            let normPath = Self.normalizePath(forServiceID: inferredService.id, path: parsedURL.path)
+                            if normPath != parsedURL.path {
+                                var comp = URLComponents(url: parsedURL, resolvingAgainstBaseURL: false)
+                                comp?.path = normPath
+                                finalURL = comp?.url ?? parsedURL
+                            }
+                            extractedURL = finalURL
+                        }
+                    }
+                }
+            }
+
+            guard let serviceID = targetService, Self.service(serviceID) != nil else { return }
+            pendingNavigation = PendingNavigation(serviceID: serviceID, url: extractedURL)
+            return
+        }
+
+        // Case B: Direct service routing: noscroll://instagram/p/12345 or noscroll://instagram/reel/12345
+        if let matchedService = Self.service(host) {
+            let path = url.path
+            var targetURL: URL? = nil
+            if !path.isEmpty && path != "/" {
+                let normPath = Self.normalizePath(forServiceID: matchedService.id, path: path)
+                var urlComponents = URLComponents(url: matchedService.home, resolvingAgainstBaseURL: false)
+                urlComponents?.path = normPath
+                urlComponents?.query = url.query
+                urlComponents?.fragment = url.fragment
+                targetURL = urlComponents?.url
+            }
+            pendingNavigation = PendingNavigation(serviceID: matchedService.id, url: targetURL)
+        }
     }
 
     func bundleVersion(for serviceID: String) -> String {
