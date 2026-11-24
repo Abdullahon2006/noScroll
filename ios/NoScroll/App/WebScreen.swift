@@ -4,6 +4,7 @@ import WebKit
 /// Hosts the wrapped browser and gives it a minimal chrome.
 struct WebScreen: View {
     let service: AppState.Service
+    var initialURL: URL? = nil
 
     @EnvironmentObject private var state: AppState
     @Environment(\.dismiss) private var dismiss
@@ -124,6 +125,14 @@ struct WebScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
             isKeyboardVisible = false
         }
+        .onChange(of: state.pendingNavigation) { _, nav in
+            if let nav, nav.serviceID == service.id {
+                if let targetURL = nav.url {
+                    navBridge.navigate(to: targetURL)
+                }
+                state.pendingNavigation = nil
+            }
+        }
         .onAppear { state.didOpen(service) }
     }
 
@@ -158,6 +167,7 @@ struct WebScreen: View {
         if let raw = state.rawBundles[service.id] {
             WebViewContainer(
                 service: service,
+                initialURL: initialURL,
                 engineSource: state.engineSource,
                 bundleRaw: raw,
                 settings: state.settings,
@@ -177,6 +187,7 @@ struct WebScreen: View {
 /// Bridges the UIKit web controller into SwiftUI.
 struct WebViewContainer: UIViewControllerRepresentable {
     let service: AppState.Service
+    var initialURL: URL? = nil
     let engineSource: String
     let bundleRaw: Data
     let settings: [String: Bool]
@@ -187,7 +198,7 @@ struct WebViewContainer: UIViewControllerRepresentable {
         let session = WebSession(id: service.sessionID, service: service.id, displayName: service.name)
         return WrappedWebViewController(
             session: session,
-            startURL: service.home,
+            startURL: initialURL ?? service.home,
             dataStore: WKWebsiteDataStore(forIdentifier: service.sessionID),
             engineSource: engineSource,
             bundleRaw: bundleRaw,

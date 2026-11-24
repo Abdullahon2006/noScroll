@@ -11,6 +11,7 @@ struct HomeView: View {
 
     @State private var selection: String = AppState.services[0].id
     @State private var openService: AppState.Service?
+    @State private var openInitialURL: URL?
     @State private var showSettingsFor: AppState.Service?
     @State private var showWidgetBanner = true
     /// The banner was tapped: the widget steps are on screen.
@@ -45,25 +46,45 @@ struct HomeView: View {
             }
         }
         .background(Theme.paper.ignoresSafeArea())
-        .fullScreenCover(item: $openService) { WebScreen(service: $0) }
+        .fullScreenCover(item: $openService) { WebScreen(service: $0, initialURL: openInitialURL) }
         .sheet(item: $showSettingsFor) { ServiceSettingsView(service: $0) }
         // The banner: the three steps to add a widget.
         .sheet(isPresented: $showWidgetSteps) {
             WidgetsScreen(onSetUp: { showWidgetSteps = false }, onLater: { showWidgetSteps = false },
                           stepsFirst: true, laterTitle: "Close")
         }
-        // A widget tap lands here: select that service and open it straight
+        // A widget tap or deep link lands here: select that service and open it straight
         // away, so the shortcut is one tap rather than two.
-        .onChange(of: state.pendingService) { _, id in openPending(id) }
-        // A tap that came while Sign in with publik was on screen is already set.
-        .onAppear { openPending(state.pendingService) }
+        .onChange(of: state.pendingNavigation) { _, nav in
+            if let nav { openNavigation(nav) }
+        }
+        // A tap or link that arrived while Sign in with publik was on screen is already set.
+        .onAppear {
+            if let nav = state.pendingNavigation { openNavigation(nav) }
+        }
     }
 
-    private func openPending(_ id: String?) {
-        guard let id, let service = AppState.service(id) else { return }
-        selection = id
-        openService = service
-        state.pendingService = nil
+    private func openNavigation(_ nav: AppState.PendingNavigation) {
+        guard let service = AppState.service(nav.serviceID) else { return }
+        selection = service.id
+
+        if openService == nil {
+            openInitialURL = nav.url
+            openService = service
+            state.pendingNavigation = nil
+        } else if openService?.id == service.id {
+            // Already open on this service; WebScreen handles in-place navigation
+            // and clears state.pendingNavigation
+        } else {
+            // A different service was requested while one is already open:
+            // Dismiss the active cover cleanly, then present the new service.
+            openService = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                openInitialURL = nav.url
+                openService = service
+                state.pendingNavigation = nil
+            }
+        }
     }
 
     // MARK: - Pieces
@@ -79,7 +100,10 @@ struct HomeView: View {
                 .minimumScaleFactor(0.6)
             Spacer()
             Button {
-                if let s = AppState.service(selection) { openService = s }
+                if let s = AppState.service(selection) {
+                    openInitialURL = nil
+                    openService = s
+                }
             } label: {
                 HStack(spacing: 7) {
                     Image(systemName: "arrow.up.right.square")
@@ -177,8 +201,11 @@ struct HomeView: View {
     private var carousel: some View {
         TabView(selection: $selection) {
             ForEach(AppState.services) { service in
-                ServiceTile(service: service) { openService = service }
-                    .tag(service.id)
+                ServiceTile(service: service) {
+                    openInitialURL = nil
+                    openService = service
+                }
+                .tag(service.id)
             }
         }
         .tabViewStyle(.page(indexDisplayMode: .always))
